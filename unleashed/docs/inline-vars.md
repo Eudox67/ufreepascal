@@ -60,17 +60,19 @@ end;
 
 #### Type promotion rules
 
-Small types are promoted to avoid surprising narrow ranges:
+Sub-register integer types are promoted to `PtrInt` (signed native word: `LongInt` on 32-bit targets, `Int64` on 64-bit) so that the inferred variable holds a full register without sign-extend on every use. `Char` is promoted to the default string type for consistency with multi-char literals.
 
-| Expression type                        | Inferred as                  |
-|----------------------------------------|------------------------------|
-| `Byte`, `ShortInt`, `Word`, `SmallInt` | `LongInt`                    |
-| `Char`                                 | `String` (default string type) |
+| Expression type                                        | Inferred as           |
+|--------------------------------------------------------|-----------------------|
+| any integer smaller than `PtrInt` (8/16/32-bit on x64) | `PtrInt`              |
+| `Char`                                                 | `String` (default string type) |
 
 Explicit typecasts bypass promotion:
 
 ```pas
-var b := Byte(10); // Byte, not LongInt
+var b := Byte(10);      // Byte (1 byte), explicit cast wins
+var c := Cardinal(42);  // LongWord (4 bytes), explicit cast wins
+var i := 10;            // PtrInt (Int64 on x64, LongInt on x86)
 ```
 
 #### Array literal type inference

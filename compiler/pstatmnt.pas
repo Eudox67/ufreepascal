@@ -3217,15 +3217,17 @@ implementation
                       else
                         hdef := cshortstringtype;
                     end;
-                  { For inline var declarations, promote sub-32-bit integer
-                    types to LongInt so that e.g. var i := 10 yields a 4-byte
-                    signed integer instead of a signed byte. Skip promotion
-                    when the user wrote an explicit typecast (e.g. byte(10))
-                    - detected via nf_explicit flag preserved through
-                    constant folding by the typeconv node. }
+                  { For inline var declarations, promote sub-PtrInt integer
+                    types to PtrInt (signed native word: LongInt on 32-bit,
+                    Int64 on 64-bit). var i := 10 yields a register-sized
+                    signed integer instead of a signed byte, avoiding both
+                    the surprise narrow range and an extra sign-extend on
+                    every use. Skip promotion when the user wrote an explicit
+                    typecast (e.g. byte(10)) - detected via nf_explicit flag
+                    preserved through constant folding by the typeconv node. }
                   if not(nf_explicit in initexpr.flags) and is_integer(hdef) and
-                     (torddef(hdef).ordtype in [s8bit,u8bit,s16bit,u16bit]) then
-                    hdef := s32inttype;
+                     (hdef.size < ptrsinttype.size) then
+                    hdef := ptrsinttype;
                   for i := 0 to sc.count - 1 do
                     begin
                       tabstractnormalvarsym(sc[i]).vardef := hdef;
