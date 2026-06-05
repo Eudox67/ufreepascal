@@ -56,11 +56,23 @@ Word-based modify-and-assign operators that the standard set is missing: `div=`,
 
 Always available in every mode; no modeswitch and independent of `{$coperators on}`.
 
+## [SwapValues Intrinsic](swapvalues.md)
+
+Builtin `SwapValues(a, b)` that swaps two same-typed assignable variables with a bitwise move, callable with no `uses` beyond the implicit `System` unit. For managed types (string, dynamic array, interface, Variant) it swaps the reference words with zero `incr_ref` / `decr_ref` churn; ordinals and pointer-sized operands lower to a register swap, larger types to a raw byte exchange. The point is to swap without dragging in SysUtils (`Swap<T>` / `Exchange<T>`) and its exception and handler setup. `SwapValues` is a fresh name with no RTL clash, and a user-declared `SwapValues` symbol shadows the builtin, so it never breaks existing code.
+
+Unleashed-mode only; no separate modeswitch.
+
 ## [Indexed Labels & Lazy Labels](indexed-labels.md)
 
 Declare arrays of labels with numeric ranges (`label state[0..4]`) or string keys (`label action['start', 'stop']`) and jump to them by index. Useful for dispatch tables and state machines.
 
 Available whenever `{$goto on}` is active; no dedicated modeswitch.
+
+## [Composable Records](composable-records.md)
+
+Record composition without duplicating fields, plus C-style memory overlap and per-field layout control. Three composition forms - `embed TBase;` flattens fields of an existing record into the outer scope (declaration-time duplicate detection rejects name collisions), `record fields end;` (and `packed`/`bitpacked` variants) does the same for an inline anonymous record, the classic `name: T;` keeps the regular named subfield. Modern `union ... end;` replaces `case TYPE of` for plain memory overlap, can appear anywhere in the body, multiple unions per record allowed; optional `union size N` (assert + pad in bytes) / `union bitsize N` (assert in bits, byte storage) / `union align N` (cache-line placement) / `union of TYPE` (size+align+default type anchor) modifiers. `bitpacked record of TYPE` plus innermost-wins propagation enables C-style `name: N;` bitfield syntax inside (translates to `name: T bitsize N`) and `pad N;` / `pad 0;` anonymous padding / alignment markers. Per-field modifiers `align N` / `bitalign N` / `size N` / `bitsize N` give byte- and bit-level layout control for faithful WinAPI / POSIX struct ports. `OffsetOf()` / `BitOffsetOf()` / `AlignOf()` / `BitAlignOf()` / `BitSizeOf()` intrinsics for compile-time layout introspection, honouring per-field overrides where applicable. `GetMemAligned` / `AllocMemAligned` / `ReAllocMemAligned` / `FreeMemAligned` in the `system` unit deliver aligned heap allocation for cache-line patterns.
+
+Enabled via `{$modeswitch composablerecords}`.
 
 ## [Tweaks](tweaks.md)
 
@@ -68,7 +80,7 @@ Small semantic adjustments that make standard Pascal constructs behave the way m
 
 ## [Extra Improvements](extra-improvements.md)
 
-Catch-all page for smaller, targeted improvements that unlock Pascal patterns standard FPC modes reject - e.g. string-to-ordinal typecast in constant expressions (`dword('RIFF')`), or Delphi-style implicit `generic` / `specialize` syntax made available in any mode via `{$modeswitch implicitgenerics}`. Some entries are gated on their own modeswitch (and enabled by default in `unleashed`), others are `unleashed`-only with no separate switch; each entry on the page states which.
+Catch-all page for smaller, targeted improvements that unlock Pascal patterns standard FPC modes reject - e.g. string-to-ordinal typecast in constant expressions (`dword('RIFF')`), Delphi-style implicit `generic` / `specialize` syntax made available in any mode via `{$modeswitch implicitgenerics}`, or the `array[N] of T` shorthand for `array[0..N-1] of T`. Some entries are gated on their own modeswitch (and enabled by default in `unleashed`), others are `unleashed`-only with no separate switch; each entry on the page states which.
 
 ## [Multiline Strings](multiline-strings.md)
 
@@ -87,3 +99,7 @@ Enabled via `{$modeswitch striprtti}`. Off by default in `unleashed` mode.
 Three CLI flags that override metadata fields the compiler embeds into the produced binary: `--fpcsignature=` (the `.fpc.version` ident string, every target), `--linkerversion=` (PE optional header linker version, Windows only), `--osversion=` (PE optional header minimum OS version, Windows only, accepts symbolic names like `Win11` or numeric `Major.Minor`). Useful for distribution branding, build mimicry, and loader gating.
 
 CLI-only; no directive form.
+
+## [Introduced Functions, Procedures and Intrinsics](introduced-functions.md)
+
+Reference table of identifiers FPC Unleashed adds on top of stock FPC and that user code can call without an extra `uses`: compile-time intrinsics (`OffsetOf`, `BitOffsetOf`, `AlignOf`, `BitAlignOf`, extended `BitSizeOf`), and the aligned heap allocator in the `system` unit (`GetMemAligned`, `AllocMemAligned`, `ReAllocMemAligned`, `FreeMemAligned`). Each row lists the signature, category (intrinsic / RTL `system` / other RTL unit), gating modeswitch, and the feature page that covers the surrounding context.

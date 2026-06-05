@@ -228,6 +228,9 @@ implementation
                 lv:=0;
                 hv:=1;
               end
+            else if is_string(casenode.left.resultdef) then
+              { strings have no enumerable range, full coverage is impossible }
+              exit(true)
             else
               getrange(casenode.left.resultdef,lv,hv);
             Result:=casenode.labelcoverage<hv-lv;
@@ -411,10 +414,12 @@ implementation
               else
                 casenode.addelseblock(statements_til_end);
            end
-         else if is_expr and requires_else(casenode) then
-           consume(_ELSE)
          else
-           consume(_END);
+           begin
+             if is_expr and requires_else(casenode) then
+               Comment(V_Error,'`case` expression needs `else` or `otherwise` to cover unmatched values');
+             consume(_END);
+           end;
 
          if not is_expr then
            begin
@@ -461,22 +466,57 @@ implementation
             end;
         end;
 
-      function parse_branch_cond(has_subject:boolean;subject:tnode) : tnode;
+      function parse_branch_cond(has_subject:boolean;subject:tnode;out is_catchall:boolean) : tnode;
         { Parse pattern(s) for a branch. Subject mode supports comma-separated
-          patterns (OR'd) and tuple patterns with _ wildcards. }
+          patterns (OR'd) and tuple patterns with _ wildcards. A bare `_`
+          alone or anywhere in the comma list flips `is_catchall` and the
+          caller treats the whole branch as `else`. }
 
-        { equality check, or range check if `..` follows }
+        { equality check, or range check if `..` follows. when an ordinal
+          subject's range bound sits exactly at the type's natural minimum
+          (or maximum), the corresponding `>=`/`<=` check is always true
+          and only triggers `comparison might be always true` warnings;
+          drop the redundant half }
         function build_match_cond(subj,lo:tnode):tnode;
           var
             hi : tnode;
+            type_lo,type_hi : TConstExprInt;
+            skip_lower,skip_upper : boolean;
           begin
             if try_to_consume(_POINTPOINT) then
               begin
                 hi:=comp_expr([ef_accept_equal]);
                 do_typecheckpass(hi);
-                result:=caddnode.create(andn,
-                  caddnode.create(gten,subj.getcopy,lo),
-                  caddnode.create(lten,subj.getcopy,hi));
+                skip_lower:=false;
+                skip_upper:=false;
+                if is_ordinal(subj.resultdef) then
+                  begin
+                    getrange(subj.resultdef,type_lo,type_hi);
+                    if (lo.nodetype=ordconstn) and (tordconstnode(lo).value=type_lo) then
+                      skip_lower:=true;
+                    if (hi.nodetype=ordconstn) and (tordconstnode(hi).value=type_hi) then
+                      skip_upper:=true;
+                  end;
+                if skip_lower and skip_upper then
+                  begin
+                    lo.free;
+                    hi.free;
+                    result:=cordconstnode.create(1,pasbool1type,false);
+                  end
+                else if skip_lower then
+                  begin
+                    lo.free;
+                    result:=caddnode.create(lten,subj.getcopy,hi);
+                  end
+                else if skip_upper then
+                  begin
+                    hi.free;
+                    result:=caddnode.create(gten,subj.getcopy,lo);
+                  end
+                else
+                  result:=caddnode.create(andn,
+                    caddnode.create(gten,subj.getcopy,lo),
+                    caddnode.create(lten,subj.getcopy,hi));
               end
             else
               result:=caddnode.create(equaln,subj.getcopy,lo);
@@ -489,6 +529,7 @@ implementation
           sym : tsym;
           recdef : trecorddef;
         begin
+          is_catchall:=false;
           { tuple pattern with potential _ wildcards }
           if has_subject and (current_scanner.token=_LKLAMMER) and
              assigned(subject.resultdef) and (subject.resultdef.typ=recorddef) and
@@ -552,7 +593,19 @@ implementation
             end
           else
             begin
-              { normal pattern with optional comma-separated OR }
+              { bare _ at branch start: standalone catch-all, but must be
+                the LAST pattern in the branch - reject `_,...` }
+              if is_wildcard_underscore then
+                begin
+                  is_catchall:=true;
+                  consume(_ID);
+                  if current_scanner.token=_COMMA then
+                    Comment(V_Error,'`_` must be the last pattern in a `match` branch');
+                  result:=nil;
+                  exit;
+                end;
+              { normal pattern with optional comma-separated OR; `_` is only
+                allowed as the FINAL element of the comma list }
               pat:=comp_expr([ef_accept_equal]);
               do_typecheckpass(pat);
               if has_subject then
@@ -560,6 +613,16 @@ implementation
                   result:=build_match_cond(subject,pat);
                   while try_to_consume(_COMMA) do
                     begin
+                      if is_wildcard_underscore then
+                        begin
+                          is_catchall:=true;
+                          consume(_ID);
+                          if current_scanner.token=_COMMA then
+                            Comment(V_Error,'`_` must be the last pattern in a `match` branch');
+                          result.free;
+                          result:=nil;
+                          exit;
+                        end;
                       pat:=comp_expr([ef_accept_equal]);
                       do_typecheckpass(pat);
                       result:=caddnode.create(orn,result,
@@ -573,7 +636,7 @@ implementation
 
       var
         subject,cond,stmt,ifchain,firstcond,walknode,stmtblock : tnode;
-        fallthrough,has_subject,has_catchall : boolean;
+        fallthrough,has_subject,has_catchall,branch_catchall : boolean;
         stmts,exprstatements : tstatementnode;
         resultdef : tdef;
         resultvar : ttempcreatenode;
@@ -614,23 +677,22 @@ implementation
             { fallthrough: independent if-statements in repeat..until true }
             stmtblock:=internalstatements(stmts);
             repeat
-              if is_wildcard_underscore then
+              if firstcond<>nil then
                 begin
-                  consume(_ID);
-                  consume(_COLON);
+                  cond:=firstcond;
+                  firstcond:=nil;
+                  branch_catchall:=false;
+                end
+              else
+                cond:=parse_branch_cond(has_subject,subject,branch_catchall);
+              consume(_COLON);
+              if branch_catchall then
+                begin
                   addstatement(stmts,statement);
                   if not(current_scanner.token in [_END]) then
                     consume(_SEMICOLON);
                   break;
                 end;
-              if firstcond<>nil then
-                begin
-                  cond:=firstcond;
-                  firstcond:=nil;
-                end
-              else
-                cond:=parse_branch_cond(has_subject,subject);
-              consume(_COLON);
               addstatement(stmts,cifnode.create(cond,statement,nil));
               if not(current_scanner.token in [_ELSE,_OTHERWISE,_END]) then
                 consume(_SEMICOLON);
@@ -652,30 +714,14 @@ implementation
             has_catchall:=false;
             ifchain:=nil;
             repeat
-              if is_wildcard_underscore then
-                begin
-                  has_catchall:=true;
-                  consume(_ID);
-                  consume(_COLON);
-                  if is_expr then
-                    begin
-                      stmt:=expr(true);
-                      resultdef:=branch_type(resultdef,stmt.resultdef);
-                    end
-                  else
-                    stmt:=statement;
-                  append_else(ifchain,stmt);
-                  if not(current_scanner.token in [_END]) then
-                    consume(_SEMICOLON);
-                  break;
-                end;
               if firstcond<>nil then
                 begin
                   cond:=firstcond;
                   firstcond:=nil;
+                  branch_catchall:=false;
                 end
               else
-                cond:=parse_branch_cond(has_subject,subject);
+                cond:=parse_branch_cond(has_subject,subject,branch_catchall);
               consume(_COLON);
               if is_expr then
                 begin
@@ -684,13 +730,32 @@ implementation
                 end
               else
                 stmt:=statement;
+              if branch_catchall then
+                begin
+                  has_catchall:=true;
+                  append_else(ifchain,stmt);
+                  if not(current_scanner.token in [_END]) then
+                    consume(_SEMICOLON);
+                  break;
+                end;
               stmt:=cifnode.create(cond,stmt,nil);
               append_else(ifchain,stmt);
               if not(current_scanner.token in [_ELSE,_OTHERWISE,_END]) then
                 consume(_SEMICOLON);
             until current_scanner.token in [_ELSE,_OTHERWISE,_END];
-            if try_to_consume(_ELSE) or try_to_consume(_OTHERWISE) then
+            if has_catchall and (current_scanner.token in [_ELSE,_OTHERWISE]) then
               begin
+                Comment(V_Error,'`_:` already covers unmatched values, drop trailing `else`/`otherwise`');
+                consume(current_scanner.token);
+                if is_expr then
+                  expr(true).free
+                else
+                  statements_til_end.free;
+              end
+            else if try_to_consume(_ELSE) or try_to_consume(_OTHERWISE) then
+              begin
+                { in expr mode `else`/`otherwise <expr>` terminates the match -
+                  no `end` keyword expected, mirroring case-style else }
                 has_catchall:=true;
                 if is_expr then
                   begin
@@ -701,10 +766,12 @@ implementation
                   stmt:=statements_til_end;
                 append_else(ifchain,stmt);
               end
-            else if is_expr and not has_catchall then
-              consume(_ELSE)
             else
-              consume(_END);
+              begin
+                if is_expr and not has_catchall then
+                  Comment(V_Error,'`match` expression needs `_:`, `else` or `otherwise` to cover unmatched values');
+                consume(_END);
+              end;
             if has_subject then
               subject.free;
             if not is_expr then
@@ -2921,7 +2988,7 @@ implementation
         else if is_boolean(arrconstr.left.resultdef) then
           elemdef := pasbool8type
         else if is_integer(arrconstr.left.resultdef) then
-          elemdef := ptrsinttype
+          elemdef := s32inttype
         else if is_enum(arrconstr.left.resultdef) then
           elemdef := arrconstr.left.resultdef
         else if arrconstr.left.resultdef.typ = floatdef then
@@ -3232,17 +3299,15 @@ implementation
                       else
                         hdef := cshortstringtype;
                     end;
-                  { For inline var declarations, promote sub-PtrInt integer
-                    types to PtrInt (signed native word: LongInt on 32-bit,
-                    Int64 on 64-bit). var i := 10 yields a register-sized
-                    signed integer instead of a signed byte, avoiding both
-                    the surprise narrow range and an extra sign-extend on
-                    every use. Skip promotion when the user wrote an explicit
-                    typecast (e.g. byte(10)) - detected via nf_explicit flag
-                    preserved through constant folding by the typeconv node. }
+                  { For inline var declarations, promote sub-32-bit integer
+                    types to LongInt so that e.g. var i := 10 yields a 4-byte
+                    signed integer instead of a signed byte. Skip promotion
+                    when the user wrote an explicit typecast (e.g. byte(10))
+                    - detected via nf_explicit flag preserved through
+                    constant folding by the typeconv node. }
                   if not(nf_explicit in initexpr.flags) and is_integer(hdef) and
-                     (hdef.size < ptrsinttype.size) then
-                    hdef := ptrsinttype;
+                     (torddef(hdef).ordtype in [s8bit,u8bit,s16bit,u16bit]) then
+                    hdef := s32inttype;
                   for i := 0 to sc.count - 1 do
                     begin
                       tabstractnormalvarsym(sc[i]).vardef := hdef;
@@ -3951,8 +4016,10 @@ implementation
                end;
              { don't typecheck yet, because that will also simplify, which may
                result in not detecting certain kinds of syntax errors --
-               see mantis #15594 }
-             p:=expr(false);
+               see mantis #15594. allow lazy-label creation here because we
+               are at statement start, where `IDENT:` and `IDENT[i]:` legally
+               declare a new label }
+             p:=expr(false,[ef_allow_lazy_label]);
              { save the current_scanner.pattern here for latter usage, the label could be "000",
                even if we read an expression, the current_scanner.pattern is still valid if it's really
                a label (FK)

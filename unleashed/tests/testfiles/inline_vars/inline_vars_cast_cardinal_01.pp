@@ -1,7 +1,11 @@
 program inline_vars_cast_cardinal_01;
 {$mode unleashed}
 
+<<<<<<< HEAD
 // explicit Cardinal cast bypasses the PtrInt promotion and gives a
+=======
+// explicit Cardinal cast bypasses the LongInt promotion and gives a
+>>>>>>> origin/main
 // 4-byte unsigned slot
 
 begin

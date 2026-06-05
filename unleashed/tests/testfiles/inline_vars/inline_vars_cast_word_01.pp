@@ -2,7 +2,11 @@ program inline_vars_cast_word_01;
 {$mode unleashed}
 
 // explicit Word cast keeps the variable at 2 bytes (16-bit unsigned),
+<<<<<<< HEAD
 // no promotion to PtrInt
+=======
+// no promotion to LongInt
+>>>>>>> origin/main
 
 begin
   var w := Word(1000);

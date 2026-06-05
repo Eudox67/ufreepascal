@@ -366,7 +366,9 @@ implementation
 
          { two records where at least one is a tuple: structural compat
            when shapes match (field count, names, types in order).
-           Positional tuples ignore names on either side. }
+           Positional tuples ignore names on either side. Report te_exact
+           so method declaration/implementation pairs whose tuple types
+           parse to separate recorddefs still match via equal_signature. }
          if (def_from.typ=recorddef) and
             (def_to.typ=recorddef) and
             ((df_tuple in def_from.defoptions) or
@@ -374,7 +376,7 @@ implementation
             tuples_have_equal_shape(trecorddef(def_from),trecorddef(def_to)) then
           begin
             doconv:=tc_equal;
-            compare_defs_ext:=te_equal;
+            compare_defs_ext:=te_exact;
             exit;
           end;
 
@@ -686,8 +688,9 @@ implementation
                    end;
                  arraydef :
                    begin
-                     if ((m_mac in current_settings.modeswitches) or
-                         (m_stringordcast in current_settings.modeswitches)) and
+                     if (((m_mac in current_settings.modeswitches) or
+                          ((m_stringordcast in current_settings.modeswitches) and
+                           (cdo_explicit in cdoptions)))) and
                         is_integer(def_to) and
                         (fromtreetype=stringconstn) then
                        begin

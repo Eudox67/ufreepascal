@@ -400,10 +400,18 @@ implementation
                tabstractvarsym(symtableentry).IncRefCountBy(1);
                resultdef:=tabstractvarsym(symtableentry).vardef;
                { Nested variable? The we need to load the framepointer of
-                 the parent procedure }
+                 the parent procedure. blocksymtable covers block-scoped
+                 inline vars - they inherit the enclosing procedure as
+                 defowner so the parentfp/capture logic below works }
                if assigned(current_procinfo) and
-                  (symtable.symtabletype in [localsymtable,parasymtable]) and
-                  (symtable.symtablelevel<>current_procinfo.procdef.parast.symtablelevel) then
+                  (symtable.symtabletype in [localsymtable,parasymtable,blocksymtable]) and
+                  (symtable.symtablelevel<>current_procinfo.procdef.parast.symtablelevel) and
+                  { a block-scoped var whose blocksymtable belongs to the current procdef
+                    lives on the current frame, not a parent's. when an anonymous function
+                    is reparented into a capturer method its block symtables keep the old
+                    nested level, so a managed var's finalization would otherwise look like
+                    a parent-frame access - compare defowner identity, not just level }
+                  (symtable.defowner<>current_procinfo.procdef) then
                  begin
                    if assigned(left) then
                      internalerror(200309289);

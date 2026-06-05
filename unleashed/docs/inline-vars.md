@@ -60,19 +60,17 @@ end;
 
 #### Type promotion rules
 
-Sub-register integer types are promoted to `PtrInt` (signed native word: `LongInt` on 32-bit targets, `Int64` on 64-bit) so that the inferred variable holds a full register without sign-extend on every use. `Char` is promoted to the default string type for consistency with multi-char literals.
+Small types are promoted to avoid surprising narrow ranges:
 
-| Expression type                                        | Inferred as           |
-|--------------------------------------------------------|-----------------------|
-| any integer smaller than `PtrInt` (8/16/32-bit on x64) | `PtrInt`              |
-| `Char`                                                 | `String` (default string type) |
+| Expression type                        | Inferred as                  |
+|----------------------------------------|------------------------------|
+| `Byte`, `ShortInt`, `Word`, `SmallInt` | `LongInt`                    |
+| `Char`                                 | `String` (default string type) |
 
 Explicit typecasts bypass promotion:
 
 ```pas
-var b := Byte(10);      // Byte (1 byte), explicit cast wins
-var c := Cardinal(42);  // LongWord (4 bytes), explicit cast wins
-var i := 10;            // PtrInt (Int64 on x64, LongInt on x86)
+var b := Byte(10); // Byte, not LongInt
 ```
 
 #### Array literal type inference
@@ -82,7 +80,7 @@ A bare `[...]` literal on the right-hand side of an inferred `var` yields a prop
 | First element             | Inferred element type |
 |---------------------------|-----------------------|
 | string / char literal     | `AnsiString`          |
-| integer literal           | `PtrInt`              |
+| integer literal           | `LongInt`             |
 | float literal             | `Double`              |
 | boolean literal           | `Boolean`             |
 | enum value                | the enum type         |
@@ -103,7 +101,7 @@ Two diagnostic edge cases:
 
 ```pas
 var a := ['', 'a', 'bb', 'longer'];        // array of AnsiString, all 4 elements kept fully
-var c := [1, 2, 1_000_000];                // array of PtrInt
+var c := [1, 2, 1_000_000];                // array of LongInt
 var d := [3.14, 2.71];                     // array of Double
 var e := [true, false];                    // array of Boolean
 var pa := [nil, nil, nil];                 // array of Pointer (hint emitted)
@@ -114,7 +112,7 @@ var x := [];                               // array of AnsiString (hint: empty, 
 var bad := ['aaa', 1, 'bbb'];
 ```
 
-Element category is what matters, not size: `[10, 200_000]` infers `array of PtrInt` regardless of whether individual literals would fit in `Byte`. Without this rule the parser would silently emit a static array sized to the first element and truncate the rest. Use an explicit declaration if you need a different shape: `var fixed: array[0..2] of String := [...]`.
+Element category is what matters, not size: `[10, 200_000]` infers `array of LongInt` regardless of whether individual literals would fit in `Byte`. Without this rule the parser would silently emit a static array sized to the first element and truncate the rest. Use an explicit declaration if you need a different shape: `var fixed: array[0..2] of String := [...]`.
 
 ## For-loop variables
 

@@ -16,6 +16,7 @@
   - [Match Statement](#match-statement)
   - [Multi-Variable Initialization](#multi-variable-initialization)
   - [Flexible Array Members](#flexible-array-members)
+  - [Composable Records](#composable-records)
   - [Scoped Cleanup (defer, autofree, scoped with)](#scoped-cleanup)
   - [For-Step](#for-step)
   - [Tweaks](#tweaks)
@@ -393,6 +394,104 @@ The pattern is what Win32 headers usually express today as `array[0..0] of T` or
 Restrictions enforced at parse time: FAM must be the last field of a plain record with at least one preceding field; no FAMs in classes, objects, variant parts, or as `class var` / `threadvar`; FAM-records cannot be embedded in another type, used as array elements, declared on the stack, passed by value, or returned by value. Use `PFamRec` (a pointer) wherever a FAM-record would otherwise live by value.
 
 See [unleashed/docs/flexible-arrays.md](unleashed/docs/flexible-arrays.md) for the full rule list, memory layout diagram, comparison with `array of T`, and PPU notes.
+
+---
+
+### Composable Records
+
+**Activate:** available in Unleashed mode (modeswitch `composablerecords`).
+
+Three composition forms for records: anonymous `embed` of another record type with auto-flatten, inline anonymous record bodies, and `union` blocks for memory overlap. Combined with per-record / per-field size and alignment modifiers, C-style bitfield syntax, and compile-time `OffsetOf` / `BitOffsetOf` / `AlignOf` / `BitAlignOf` intrinsics, this gives Pascal records the layout control that C structs have, without giving up Pascal type safety.
+
+#### Anonymous embed
+
+Fields, methods, properties, and operators of an embedded record flatten into the outer record. The carrier `$compose$N` is hidden; the user sees a flat layout.
+
+```pascal
+type
+  TVec = record
+    x, y: integer;
+    function Length: integer;
+    class operator + (a, b: TVec): TVec;
+  end;
+  TPoint = record
+    embed TVec;       // x, y, Length, + flatten into TPoint
+    z: integer;
+  end;
+
+var
+  p1, p2: TPoint;
+  v: TVec;
+begin
+  p1.x := 3; p1.y := 4;
+  WriteLn(p1.Length);       // method auto-flattened
+  v := p1 + p2;             // operator auto-flattened, returns TVec
+end;
+```
+
+Strict duplicate detection at declaration time catches name clashes across the composition chain, including cascades through nested embeds. RTTI exposes flattened members as if they were direct fields (`TotalFieldCount` reports the flat count, `GetField('x')` resolves through the carrier with the accumulated offset).
+
+#### Inline anonymous record
+
+A `record fields end;` body without a name flattens its members directly into the outer record. Useful for nested layouts when you do not want a named subfield in the way.
+
+```pascal
+type
+  THeader = record
+    sig: longword;
+    record
+      lo, hi: word;
+    end;                  // lo, hi flatten into THeader
+    crc: longword;
+  end;
+```
+
+#### Union (memory overlap)
+
+`union ... end;` is a memory overlap block - all variants share the same offset. Cleaner than legacy `case TAG of` when you only want the overlay, not the discriminator.
+
+```pascal
+type
+  TPacket = record
+    code: byte;
+    union
+      data: byte;
+      record cmd, arg: word; end;
+    end;
+  end;
+```
+
+#### Layout modifiers
+
+Pre-body modifiers on `record` and `union`: `align N`, `bitalign N`, `size N`, `bitsize N`, `of T`. Per-field suffix on individual fields: same set. `bitpacked record of T` opens C-style bitfield syntax inside, where `flags: 4;` translates to `flags: T bitsize 4`. `pad N;` is anonymous padding (N bits); `pad 0;` aligns to the next storage-unit boundary.
+
+```pascal
+type
+  TFlags = bitpacked record of byte
+    a, b: 1;             // C-style: each is 1 bit of byte
+    pad 2;               // anonymous 2-bit gap
+    nibble: 4;
+  end;
+
+  TAligned = record align 64
+    data: array[0..7] of qword;   // cache-line aligned
+  end;
+```
+
+#### Compile-time introspection
+
+```pascal
+WriteLn(OffsetOf(TPoint.z));      // 8 - byte offset, composition-aware
+WriteLn(BitOffsetOf(TFlags.nibble));  // 4 - bit offset
+WriteLn(AlignOf(TAligned));       // 64
+WriteLn(BitSizeOf(TFlags.a));     // 1 - per-field bitsize override
+```
+
+#### Aligned heap
+
+`GetMemAligned` / `AllocMemAligned` / `ReAllocMemAligned` / `FreeMemAligned` in the `system` unit allocate heap memory honouring a record's `align N` clause (default `GetMem` returns 16-byte aligned only). No `uses` clause required.
+
+See [unleashed/docs/composable-records.md](unleashed/docs/composable-records.md) for the full reference: all three forms, every modifier, the C-style bitfield grammar, intrinsics catalogue, generic interaction, RTTI publication, PPU layout, visibility and shadowing rules, and real-world WinAPI port examples (`SYSTEM_INFO`, `MEMORYSTATUSEX`).
 
 ---
 
@@ -930,14 +1029,19 @@ See [unleashed/docs/binary-metadata.md](unleashed/docs/binary-metadata.md) for f
 
 ### Extra Improvements
 
-Smaller, targeted improvements that unlock Pascal patterns standard FPC modes reject. Each is gated on its own modeswitch (some are on by default in `unleashed`, others must be opted into):
+Smaller, targeted improvements that unlock Pascal patterns standard FPC modes reject. Modeswitch entries are on by default in `unleashed` and can be opted into elsewhere via `{$modeswitch name}`; unleashed-only entries have no separate switch.
 
-- **`stringordcast`** - cast a string literal to an ordinal type at compile time, e.g. `dword('RIFF')` or `word('MZ')`. Useful for signature checks. *On by default in unleashed.*
-- **`typehelpers`** - `type helper for T` on any named type, not just classes and records.
-- **`multihelpers`** - several helpers for the same type visible in one scope (instead of "last one wins").
-- **`implicitgenerics`** - Delphi-style implicit `generic` / `specialize` syntax (`TList<T>` without keywords). Stock FPC locks this to `{$mode delphi}`; the modeswitch makes it usable in any mode.
+| Improvement                  | What it does                                                       | Example                                          | Enable                              |
+|------------------------------|--------------------------------------------------------------------|--------------------------------------------------|-------------------------------------|
+| String-to-ordinal cast       | Cast string literal to integer at compile time                     | `dword('RIFF')`                                  | `stringordcast` (on in unleashed)   |
+| Type helpers anywhere        | `type helper for T` on any named type, not just classes/records    | `type helper for integer`                        | `typehelpers` (on in unleashed)     |
+| Multi-helpers                | Several helpers for one type visible at once (no "last wins")      | two `helper for integer`, both methods callable  | `multihelpers` (on in unleashed)    |
+| Implicit generics            | Delphi-style `<T>` without `generic` / `specialize` keywords       | `TList<integer>`                                 | `implicitgenerics` (on in unleashed)|
+| `array[N] of T` shorthand    | `array[N]` = `array[0..N-1]`; multi-dim and ranges mix freely      | `array[10] of integer`, `array[3, 'a'..'z']`     | unleashed-only                      |
+| Compound `+=` on properties  | `prop += x` (stock rejects with "Variable identifier expected")    | `f.Count += 5`                                   | unleashed-only                      |
+| `inc` / `dec` on properties  | `inc(prop, n)` rewritten to getter + setter                        | `inc(c.N, 5)`                                    | unleashed-only                      |
 
-Full descriptions and examples in [unleashed/docs/extra-improvements.md](unleashed/docs/extra-improvements.md).
+Full descriptions, edge cases, and limitations in [unleashed/docs/extra-improvements.md](unleashed/docs/extra-improvements.md).
 
 ---
 
@@ -947,7 +1051,18 @@ Each feature has a dedicated reference page in [unleashed/docs/](unleashed/docs/
 
 ## Installation
 
-### Option 1: Fresh install (FPC + Lazarus via fpcupdeluxe)
+### Option 1: Official installer (recommended)
+
+Self-contained GUI installer for Windows and Linux that downloads sources, builds the compiler and Lazarus IDE into a directory of your choice, optionally installs cross compilers, and drops a desktop shortcut to the IDE. No PATH changes, no registry side effects, no overwriting of an existing FPC. Re-runs are idempotent - ticking a new cross target or addon does just that surgical change.
+
+- Repo: [fpc-unleashed/installer](https://github.com/fpc-unleashed/installer)
+- Downloads: [installer/releases](https://github.com/fpc-unleashed/installer/releases) - tagged stable releases cut on every breaking change, plus a rolling `nightly` that tracks `main`
+  - `installer_win64_x86_64.exe` - Windows host
+  - `installer_linux_x86_64` / `installer_linux_x86_64.AppImage` - Linux host
+
+Pick the binary for your host, run it, choose an install directory, tick the cross targets you want, click Install. Default install path is `C:\fpcunleashed\` on Windows and `$HOME/fpcunleashed/` on Linux.
+
+### Option 2: Fresh install (FPC + Lazarus via fpcupdeluxe)
 
 1. Download [fpcupdeluxe](https://github.com/LongDirtyAnimAlf/fpcupdeluxe) and run it once to generate the `fpcup.ini` file.
 2. Edit `fpcup.ini` and add the following under `[ALIASfpcURL]`:
@@ -972,7 +1087,7 @@ unleashed.git=https://github.com/fpc-unleashed/lazarus.git
 5. Click **Install/update FPC+Lazarus**.
 6. Optionally install cross-compilers via the `Cross` tab.
 
-### Option 2: Upgrade an existing fpcupdeluxe setup
+### Option 3: Upgrade an existing fpcupdeluxe setup
 
 1. Make sure your existing FPC + Lazarus installation was created with **fpcupdeluxe**.
 2. In your installation directory, delete or rename the `fpcsrc` folder.

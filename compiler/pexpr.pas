@@ -36,12 +36,20 @@ interface
         ef_accept_equal,
         ef_type_only,
         ef_had_specialize,
-        ef_check_attr_suffix
+        ef_check_attr_suffix,
+        { opt-in for the lazy-label creation path: when set, an unknown
+          identifier followed by `:` is auto-registered as a label sym
+          (used by the unleashed lazy-label feature in statement context).
+          Default OFF so that expression parsers (case patterns, match
+          patterns, format spec, array index const, named params, ...) get
+          a proper "Identifier not found" instead of a silently created
+          label that swallows the `:` and confuses the parser }
+        ef_allow_lazy_label
       );
       texprflags = set of texprflag;
 
-    { reads a whole expression }
-    function expr(dotypecheck:boolean) : tnode;
+    { reads a whole expression; `flags` are forwarded to sub_expr }
+    function expr(dotypecheck:boolean; flags:texprflags = []) : tnode;
 
     { reads an expression without assignments and .. }
     function comp_expr(flags:texprflags):tnode;
@@ -587,10 +595,25 @@ implementation
                      not((p1.nodetype = subscriptn) and
                          is_packed_record_or_object(tsubscriptnode(p1).left.resultdef))) then
                    begin
-                     statement_syssym:=genintconstnode(p1.resultdef.size,sizesinttype);
+                     { composablerecords: a field with an explicit `size N`
+                       override occupies exactly N bytes in the surrounding
+                       record, regardless of the declared type's natural size.
+                       `SizeOf(record.field)` now reflects the slot, matching
+                       what `OffsetOf` of the next field implies. }
+                     if (p1.nodetype = subscriptn) and
+                        (tsubscriptnode(p1).vs.custom_size <> -1) then
+                       statement_syssym:=genintconstnode(tsubscriptnode(p1).vs.custom_size,sizesinttype)
+                     else
+                       statement_syssym:=genintconstnode(p1.resultdef.size,sizesinttype);
                      if (l = in_bitsizeof_x) then
                        statement_syssym:=caddnode.create(muln,statement_syssym,cordconstnode.create(8,sizesinttype,true));
                    end
+                 { composablerecords: a field with an explicit `bitsize N`
+                   override occupies exactly N bits, regardless of the
+                   declared type's natural packed bit width }
+                 else if (p1.nodetype = subscriptn) and
+                         (tsubscriptnode(p1).vs.custom_bitsize > 0) then
+                   statement_syssym:=genintconstnode(tsubscriptnode(p1).vs.custom_bitsize,sizesinttype)
                  else
                    statement_syssym:=genintconstnode(p1.resultdef.packedbitsize,sizesinttype);
                  { type def is a struct with generic fields }
@@ -2049,6 +2072,15 @@ implementation
                      p1:=nil;
                      { typed constants are absolutebarsyms now to handle storage properly }
                      propaccesslist_to_node(p1,nil,tabsolutevarsym(sym).ref);
+                   end;
+                 enumsym:
+                   begin
+                     { composablerecords scopes anonymous enum constants
+                       to the surrounding record, so `TRec.kVal` reaches
+                       them through this dot-access path. wrap as a
+                       plain enum node, no carrier offset involved. }
+                     p1.free;
+                     p1:=genenumnode(tenumsym(sym));
                    end
                  else
                    internalerror(16);
@@ -2602,6 +2634,11 @@ implementation
      srsym  : tsym;
      srsymtable : TSymtable;
      structh    : tabstractrecorddef;
+     { composablerecords: when a flat lookup goes through composition links,
+       this is the chain of carriers (outer-most first) we must subscript
+       through before reading the target. nil/empty otherwise. owned here. }
+     compose_chain : tfplist;
+     compose_idx : longint;
      { shouldn't be used that often, so the extra overhead is ok to save
        stack space }
      dispatchstring : ansistring;
@@ -2998,6 +3035,7 @@ implementation
                          erroroutp1:=true;
                          srsym:=nil;
                          structh:=tabstractrecorddef(p1.resultdef);
+                         compose_chain:=nil;
                          if isspecialize then
                            begin
                              { consume the specialize }
@@ -3015,6 +3053,9 @@ implementation
                          else
                            begin
                              searchsym_in_record(structh,current_scanner.pattern,srsym,srsymtable);
+                             if not assigned(srsym) and
+                                (m_composable_records in current_settings.modeswitches) then
+                               lookup_in_composition(structh,current_scanner.pattern,srsym,srsymtable,compose_chain);
                              if assigned(srsym) then
                                begin
                                  old_current_filepos:=current_filepos;
@@ -3037,10 +3078,29 @@ implementation
                            begin
                              p1.free;
                              p1:=cerrornode.create;
+                             if assigned(compose_chain) then
+                               begin
+                                 compose_chain.free;
+                                 compose_chain:=nil;
+                               end;
                            end
                          else
                            if p1.nodetype<>specializen then
-                             do_member_read(structh,getaddr,srsym,p1,again,[],spezcontext);
+                             begin
+                               { composablerecords: walk the carrier chain so the
+                                 final read lands on `record.c1.c2...target` }
+                               if assigned(compose_chain) then
+                                 begin
+                                   for compose_idx:=0 to compose_chain.count-1 do
+                                     begin
+                                       p1:=csubscriptnode.create(tfieldvarsym(compose_chain[compose_idx]),p1);
+                                       structh:=tabstractrecorddef(tfieldvarsym(compose_chain[compose_idx]).vardef);
+                                     end;
+                                   compose_chain.free;
+                                   compose_chain:=nil;
+                                 end;
+                               do_member_read(structh,getaddr,srsym,p1,again,[],spezcontext);
+                             end;
                        end
                      else
                      consume(_ID);
@@ -3410,6 +3470,34 @@ implementation
       end; { while again }
     end;
 
+    { composablerecords: rediscover the carrier chain that
+      `lookup_in_composition` traversed to reach `s` on `recordh`, and
+      wrap p1 in a subscript through each carrier so the read lands on
+      `with_target.$compose$N. ... .field`. used by `is_member_read`
+      for the WithSymtable case. }
+    function compose_lookup_walk(recordh: tabstractrecorddef;
+                                 const s: TIDString;
+                                 var p1: tnode): boolean;
+      var
+        compose_sym: tsym;
+        compose_st: tsymtable;
+        chain: tfplist;
+        i: longint;
+      begin
+        result:=false;
+        if lookup_in_composition(recordh,s,compose_sym,compose_st,chain) then
+          begin
+            if assigned(chain) then
+              begin
+                for i:=0 to chain.count-1 do
+                  p1:=csubscriptnode.create(tfieldvarsym(chain[i]),p1);
+                chain.free;
+              end;
+            result:=true;
+          end;
+      end;
+
+
     function is_member_read(sym: tsym; st: tsymtable; var p1: tnode;
                             out memberparentdef: tdef): boolean;
       var
@@ -3432,6 +3520,25 @@ implementation
 
               hdef:=tnode(twithsymtable(st).withrefnode).resultdef;
               p1:=tnode(twithsymtable(st).withrefnode).getcopy;
+
+              { composablerecords: a flat name resolved through a
+                composition carrier lives in a record def deeper than
+                hdef. walk through the carrier chain so that the
+                subscripts land on `with_target.$compose$N. ... .sym`
+                before do_member_read receives the inner record def. }
+              if (hdef.typ in [recorddef,objectdef]) and
+                 (m_composable_records in current_settings.modeswitches) and
+                 (sym.typ in [fieldvarsym,procsym,propertysym]) and
+                 assigned(sym.owner) and assigned(sym.owner.defowner) and
+                 (sym.owner.defowner<>tdef(hdef)) then
+                begin
+                  if compose_lookup_walk(tabstractrecorddef(hdef),
+                       sym.name,p1) then
+                    begin
+                      memberparentdef:=tdef(sym.owner.defowner);
+                      exit;
+                    end;
+                end;
 
               if not(hdef.typ in [objectdef,classrefdef]) then
                 exit;
@@ -3825,6 +3932,217 @@ implementation
              result:=false;
            end;
 
+         { compile-time fold of `offsetof(TStruct.path.to.field)`. supports
+           composition flatten in the path: each composition hop (anon embed,
+           inline anon, expose) accumulates every carrier's own offset along
+           the chain before descending into its record. caller has not
+           consumed the OFFSETOF token yet. }
+         function parse_offsetof_like_intrinsic(in_bits: boolean): tnode;
+           { shared walker for offsetof() and bitoffsetof().
+
+             offsetof returns the field offset in bytes; if any field along
+             the path sits in a bitpacked record on a non-byte boundary the
+             intrinsic raises parser_e_offsetof_subbyte_field. bitoffsetof
+             always returns bits regardless of the record layout.
+
+             field walking + bit accumulation lives in
+             defutil.walk_field_path_bits so the preprocessor `$if`
+             evaluator can reuse it. }
+           var
+             cursym : tsym;
+             cursymtable : tsymtable;
+             cur_def : tabstractrecorddef;
+             bit_total : asizeint;
+             last_field : tsym;
+             haderr : boolean;
+             fail_at : longint;
+             path : array of TIDString;
+             orgnames : array of string;
+             last_field_name : string;
+           begin
+             consume(_ID); { eat OFFSETOF or BITOFFSETOF }
+             consume(_LKLAMMER);
+             haderr:=false;
+             bit_total:=0;
+             cur_def:=nil;
+             last_field:=nil;
+             last_field_name:='';
+             if current_scanner.token<>_ID then
+               begin
+                 consume(_ID);
+                 consume(_RKLAMMER);
+                 exit(cerrornode.create);
+               end;
+             searchsym_type(current_scanner.pattern,cursym,cursymtable);
+             if not assigned(cursym) or (cursym.typ<>typesym) or
+                not (ttypesym(cursym).typedef.typ in [recorddef,objectdef]) then
+               begin
+                 Message1(sym_e_id_no_member,current_scanner.orgpattern);
+                 haderr:=true;
+               end
+             else
+               cur_def:=tabstractrecorddef(ttypesym(cursym).typedef);
+             consume(_ID);
+             { collect dot/comma-separated field names into a path array,
+               then walk it via the shared helper. accept either
+               Pascal-style `Type.field` or C-style `Type, field` separators }
+             path:=nil;
+             orgnames:=nil;
+             while not haderr and (try_to_consume(_POINT) or try_to_consume(_COMMA)) do
+               begin
+                 if current_scanner.token<>_ID then
+                   begin
+                     consume(_ID);
+                     haderr:=true;
+                     break;
+                   end;
+                 Insert(current_scanner.pattern,path,Length(path));
+                 Insert(current_scanner.orgpattern,orgnames,Length(orgnames));
+                 consume(_ID);
+               end;
+             consume(_RKLAMMER);
+             if not haderr and (Length(path)>0) then
+               begin
+                 if not walk_field_path_bits(cur_def,path,bit_total,last_field,fail_at) then
+                   begin
+                     Message1(sym_e_id_no_member,orgnames[fail_at]);
+                     haderr:=true;
+                   end
+                 else if assigned(last_field) then
+                   last_field_name:=orgnames[High(orgnames)];
+               end;
+             if haderr then
+               result:=cerrornode.create
+             else if in_bits then
+               result:=cordconstnode.create(bit_total,sizeuinttype,true)
+             else if (bit_total mod 8)<>0 then
+               begin
+                 Message1(parser_e_offsetof_subbyte_field,last_field_name);
+                 result:=cerrornode.create;
+               end
+             else
+               result:=cordconstnode.create(bit_total div 8,sizeuinttype,true);
+           end;
+
+         function parse_alignof_like_intrinsic(in_bits: boolean): tnode;
+           { AlignOf and BitAlignOf intrinsics for composablerecords.
+
+             AlignOf returns the type or field alignment in bytes,
+             BitAlignOf returns it in bits. For a type argument the value
+             is the type's natural alignment. For a field reference the
+             value honours per-field `align N` / `bitalign N` overrides,
+             falling back to the field type's alignment when no override
+             is present. The field-path walk delegates to the shared
+             defutil.walk_field_path_bits helper. }
+           var
+             cursym : tsym;
+             cursymtable : tsymtable;
+             cur_def : tabstractrecorddef;
+             type_align : asizeint;
+             found_field : tsym;
+             haderr : boolean;
+             bit_total_unused : asizeint;
+             fail_at : longint;
+             path : array of TIDString;
+             orgnames : array of string;
+           begin
+             consume(_ID); { eat ALIGNOF or BITALIGNOF }
+             consume(_LKLAMMER);
+             haderr:=false;
+             cur_def:=nil;
+             type_align:=0;
+             found_field:=nil;
+             if current_scanner.token<>_ID then
+               begin
+                 consume(_ID);
+                 consume(_RKLAMMER);
+                 exit(cerrornode.create);
+               end;
+             searchsym(current_scanner.pattern,cursym,cursymtable);
+             if not assigned(cursym) then
+               begin
+                 Message1(sym_e_id_no_member,current_scanner.orgpattern);
+                 haderr:=true;
+               end
+             else if cursym.typ=typesym then
+               begin
+                 type_align:=ttypesym(cursym).typedef.alignment;
+                 if ttypesym(cursym).typedef.typ in [recorddef,objectdef] then
+                   cur_def:=tabstractrecorddef(ttypesym(cursym).typedef);
+               end
+             else if cursym.typ in [staticvarsym,localvarsym,paravarsym,fieldvarsym,absolutevarsym] then
+               begin
+                 { accept a variable / parameter / field as the operand;
+                   its type's alignment stands in for the typename case }
+                 type_align:=tabstractvarsym(cursym).vardef.alignment;
+                 if tabstractvarsym(cursym).vardef.typ in [recorddef,objectdef] then
+                   cur_def:=tabstractrecorddef(tabstractvarsym(cursym).vardef);
+               end
+             else
+               begin
+                 Message1(sym_e_id_no_member,current_scanner.orgpattern);
+                 haderr:=true;
+               end;
+             consume(_ID);
+             { collect optional `.field` / `,field` chain }
+             path:=nil;
+             orgnames:=nil;
+             while not haderr and (try_to_consume(_POINT) or try_to_consume(_COMMA)) do
+               begin
+                 if current_scanner.token<>_ID then
+                   begin
+                     consume(_ID);
+                     haderr:=true;
+                     break;
+                   end;
+                 Insert(current_scanner.pattern,path,Length(path));
+                 Insert(current_scanner.orgpattern,orgnames,Length(orgnames));
+                 consume(_ID);
+               end;
+             consume(_RKLAMMER);
+             if not haderr and (Length(path)>0) then
+               begin
+                 if cur_def=nil then
+                   begin
+                     Message1(sym_e_id_no_member,orgnames[0]);
+                     haderr:=true;
+                   end
+                 else if not walk_field_path_bits(cur_def,path,bit_total_unused,found_field,fail_at) then
+                   begin
+                     Message1(sym_e_id_no_member,orgnames[fail_at]);
+                     haderr:=true;
+                   end;
+               end;
+             if haderr then
+               exit(cerrornode.create);
+             if assigned(found_field) then
+               begin
+                 if in_bits then
+                   begin
+                     if tfieldvarsym(found_field).custom_bitalign>0 then
+                       result:=cordconstnode.create(tfieldvarsym(found_field).custom_bitalign,sizeuinttype,true)
+                     else if tfieldvarsym(found_field).custom_align>0 then
+                       result:=cordconstnode.create(tfieldvarsym(found_field).custom_align*8,sizeuinttype,true)
+                     else
+                       result:=cordconstnode.create(tfieldvarsym(found_field).vardef.alignment*8,sizeuinttype,true);
+                   end
+                 else
+                   begin
+                     if tfieldvarsym(found_field).custom_align>0 then
+                       result:=cordconstnode.create(tfieldvarsym(found_field).custom_align,sizeuinttype,true)
+                     else
+                       result:=cordconstnode.create(tfieldvarsym(found_field).vardef.alignment,sizeuinttype,true);
+                   end;
+               end
+             else
+               begin
+                 if in_bits then
+                   result:=cordconstnode.create(type_align*8,sizeuinttype,true)
+                 else
+                   result:=cordconstnode.create(type_align,sizeuinttype,true);
+               end;
+           end;
+
          var
            srsym: tsym;
            srsymtable: TSymtable;
@@ -3864,6 +4182,59 @@ implementation
              end
            else
              isspecialize:=ef_had_specialize in flags;
+
+           { composablerecords: offsetof(TStruct.path.to.field) returns byte
+             offset; bitoffsetof returns bit offset (always defined, even for
+             sub-byte bitpacked fields). pattern-detected here so we don't
+             depend on a sysconst symbol (which would require an RTL rebuild). }
+           if (current_scanner.token=_ID) and
+              (m_composable_records in current_settings.modeswitches) and
+              (current_scanner.pattern='OFFSETOF') then
+             begin
+               p1:=parse_offsetof_like_intrinsic(false);
+               again:=false;
+               exit;
+             end;
+           if (current_scanner.token=_ID) and
+              (m_composable_records in current_settings.modeswitches) and
+              (current_scanner.pattern='BITOFFSETOF') then
+             begin
+               p1:=parse_offsetof_like_intrinsic(true);
+               again:=false;
+               exit;
+             end;
+           if (current_scanner.token=_ID) and
+              (m_composable_records in current_settings.modeswitches) and
+              (current_scanner.pattern='ALIGNOF') then
+             begin
+               p1:=parse_alignof_like_intrinsic(false);
+               again:=false;
+               exit;
+             end;
+           if (current_scanner.token=_ID) and
+              (m_composable_records in current_settings.modeswitches) and
+              (current_scanner.pattern='BITALIGNOF') then
+             begin
+               p1:=parse_alignof_like_intrinsic(true);
+               again:=false;
+               exit;
+             end;
+
+           { the two-argument SwapValues(a,b) is a bitwise swap builtin that needs no
+             unit beyond System. only intercept when no SwapValues symbol is in scope,
+             so a user-declared SwapValues keeps resolving normally. }
+           if (current_scanner.token=_ID) and
+              (m_unleashed in current_settings.modeswitches) and
+              (current_scanner.pattern='SWAPVALUES') then
+             begin
+               searchsym(current_scanner.pattern,srsym,srsymtable);
+               if not assigned(srsym) then
+                 begin
+                   p1:=inline_swapvalues;
+                   again:=false;
+                   exit;
+                 end;
+             end;
 
            { first check for identifier }
            if current_scanner.token<>_ID then
@@ -4080,6 +4451,7 @@ implementation
                    not (sp_explicitrename in srsym.symoptions) then
                  begin
                    if not assigned(srsym) and
+                      (ef_allow_lazy_label in flags) and
                       (
                         ((current_scanner.token=_COLON) and
                          get_or_create_labelsym(orgstoredpattern,labsym,srsymtable)) or
@@ -4340,18 +4712,10 @@ implementation
              buildp:=carrayconstructornode.create(nil,buildp)
            else
             repeat
-              if (m_tuples in current_settings.modeswitches) and
-                 (current_scanner.token=_LKLAMMER) then
-                begin
-                  consume(_LKLAMMER);
-                  p1:=comp_expr([ef_accept_equal]);
-                  if current_scanner.token=_COMMA then
-                    p1:=tuple_lit_as_tempref(p1)
-                  else
-                    consume(_RKLAMMER);
-                end
-              else
-                p1:=comp_expr([ef_accept_equal]);
+              { tuple literal as array element is recognised by factor's own
+                _LKLAMMER path, which leaves the parser in the right state to
+                continue the surrounding expression (e.g. `(1)/100`) }
+              p1:=comp_expr([ef_accept_equal]);
               if try_to_consume(_POINTPOINT) then
                 begin
                   p2:=comp_expr([ef_accept_equal]);
@@ -5983,7 +6347,7 @@ implementation
       end;
 
 
-    function expr(dotypecheck : boolean) : tnode;
+    function expr(dotypecheck : boolean; flags : texprflags = []) : tnode;
 
       var
          p1,p2 : tnode;
@@ -5994,7 +6358,7 @@ implementation
          autofree_active : boolean;
       begin
          oldafterassignment:=afterassignment;
-         p1:=sub_expr(opcompare,[ef_accept_equal],nil);
+         p1:=sub_expr(opcompare,flags + [ef_accept_equal],nil);
          { get the resultdef for this expression }
          if not assigned(p1.resultdef) and
             dotypecheck then

@@ -325,9 +325,40 @@ interface
 
        tprocdef = class;
 
+       { record composition (composablerecords): kinds of links between a
+         carrier field and how its members get exposed in the surrounding
+         record's name space at lookup time }
+       tcomposition_kind = (
+         ck_anon_embed,      { `TBase;` -- visible typename, hidden carrier }
+         ck_inline_record    { `record fields end;` -- no typename, hidden carrier }
+       );
+
+       pcomposition_entry = ^tcomposition_entry;
+       tcomposition_entry = record
+         carrier      : tobject; { tfieldvarsym; opaque here to avoid forward dep }
+         carrier_deref: tderef;
+         kind         : tcomposition_kind;
+       end;
+
+       { temporary holder for per-field sizing overrides loaded from a PPU.
+         the field reference is a tderef until derefimpl resolves it, at
+         which point we copy the values onto the resolved field's slots
+         and drop the list. }
+       pfield_sizing_entry = ^tfield_sizing_entry;
+       tfield_sizing_entry = record
+         field_deref    : tderef;
+         custom_bitsize : longint;
+         custom_size    : longint;
+         custom_align   : longword;
+         custom_bitalign: longword;
+       end;
+
        tabstractrecorddef= class(tstoreddef)
        private
           rttistring     : string;
+          fcompositions  : tfplist; { lazy; entries are pcomposition_entry }
+          ffield_sizing_loaded : tfplist; { transient, ppu load -> derefimpl }
+          ffield_sizing_write  : tfplist; { transient, buildderefimpl -> ppuwrite }
 {$ifdef DEBUG_NODE_XML}
        protected
           procedure XMLPrintDefData(var T: Text; Sym: TSym); override;
@@ -350,6 +381,13 @@ interface
           constructor ppuload(dt:tdeftyp;ppufile:tcompilerppufile);
           procedure ppuwrite(ppufile:tcompilerppufile);override;
           destructor destroy; override;
+          { add a composition link from `carrier` to its members; takes ownership
+            of the entry. NOTE: caller passes a tfieldvarsym typed as tobject. }
+          procedure add_composition(carrier_sym: tobject; kind: tcomposition_kind);
+          { iterate compositions: returns the linked carrier and kind for index i,
+            or nil/ck_* sentinel if i out of range. count is composition_count. }
+          function composition_count: longint;
+          function composition_at(i: longint): pcomposition_entry;
           procedure buildderefimpl;override;
           procedure derefimpl;override;
           procedure check_forwards; virtual;
@@ -4849,6 +4887,9 @@ implementation
     constructor tabstractrecorddef.ppuload(dt:tdeftyp;ppufile:tcompilerppufile);
       var
         ro: trtti_option;
+        i, n : longint;
+        e : pcomposition_entry;
+        fse : pfield_sizing_entry;
       begin
         inherited ppuload(dt,ppufile);
         objrealname:=ppufile.getpshortstring;
@@ -4861,11 +4902,48 @@ implementation
         rtti.clause:=trtti_clause(ppufile.getbyte);
         for ro in trtti_option do
           ppufile.getset(tppuset1(rtti.options[ro]));
+        { composablerecords: composition entries gated on the flag so older
+          PPUs without the section continue to load }
+        if oo_has_compositions in objectoptions then
+          begin
+            n:=ppufile.getlongint;
+            if n>0 then
+              fcompositions:=tfplist.create;
+            for i:=0 to n-1 do
+              begin
+                new(e);
+                e^.kind:=tcomposition_kind(ppufile.getbyte);
+                e^.carrier:=nil;
+                ppufile.getderef(e^.carrier_deref);
+                fcompositions.add(e);
+              end;
+          end;
+        { composablerecords: per-field sizing overrides -- same gate. stored
+          transiently until derefimpl resolves the field derefs. }
+        if oo_has_field_sizing in objectoptions then
+          begin
+            n:=ppufile.getlongint;
+            if n>0 then
+              ffield_sizing_loaded:=tfplist.create;
+            for i:=0 to n-1 do
+              begin
+                new(fse);
+                ppufile.getderef(fse^.field_deref);
+                fse^.custom_bitsize:=ppufile.getlongint;
+                fse^.custom_size:=ppufile.getlongint;
+                fse^.custom_align:=ppufile.getlongint;
+                fse^.custom_bitalign:=ppufile.getlongint;
+                ffield_sizing_loaded.add(fse);
+              end;
+          end;
       end;
 
     procedure tabstractrecorddef.ppuwrite(ppufile: tcompilerppufile);
       var
         ro: trtti_option;
+        i : longint;
+        e : pcomposition_entry;
+        fse : pfield_sizing_entry;
       begin
         inherited ppuwrite(ppufile);
         ppufile.putstring(objrealname^);
@@ -4877,10 +4955,78 @@ implementation
         ppufile.putbyte(byte(rtti.clause));
         for ro in trtti_option do
           ppufile.putset(tppuset1(rtti.options[ro]));
+        { composablerecords: composition entries -- only when the flag is on
+          (older readers without the flag won't try to read the section) }
+        if oo_has_compositions in objectoptions then
+          begin
+            ppufile.putlongint(composition_count);
+            for i:=0 to composition_count-1 do
+              begin
+                e:=composition_at(i);
+                ppufile.putbyte(byte(e^.kind));
+                ppufile.putderef(e^.carrier_deref);
+              end;
+          end;
+        { composablerecords: per-field sizing/alignment overrides -- same gate.
+          the derefs were already registered in buildderefimpl (so they live in
+          the serialized derefdata block); here we only emit the pre-built
+          indices and the snapshotted values. }
+        if oo_has_field_sizing in objectoptions then
+          begin
+            if assigned(ffield_sizing_write) then
+              begin
+                ppufile.putlongint(ffield_sizing_write.count);
+                for i:=0 to ffield_sizing_write.count-1 do
+                  begin
+                    fse:=pfield_sizing_entry(ffield_sizing_write[i]);
+                    ppufile.putderef(fse^.field_deref);
+                    ppufile.putlongint(fse^.custom_bitsize);
+                    ppufile.putlongint(fse^.custom_size);
+                    ppufile.putlongint(longint(fse^.custom_align));
+                    ppufile.putlongint(longint(fse^.custom_bitalign));
+                  end;
+              end
+            else
+              ppufile.putlongint(0);
+          end;
       end;
 
     destructor tabstractrecorddef.destroy;
+      var
+        i : longint;
+        e : pcomposition_entry;
+        fse : pfield_sizing_entry;
       begin
+        if assigned(fcompositions) then
+          begin
+            for i:=0 to fcompositions.count-1 do
+              begin
+                e:=pcomposition_entry(fcompositions[i]);
+                dispose(e);
+              end;
+            fcompositions.free;
+            fcompositions:=nil;
+          end;
+        if assigned(ffield_sizing_loaded) then
+          begin
+            for i:=0 to ffield_sizing_loaded.count-1 do
+              begin
+                fse:=pfield_sizing_entry(ffield_sizing_loaded[i]);
+                dispose(fse);
+              end;
+            ffield_sizing_loaded.free;
+            ffield_sizing_loaded:=nil;
+          end;
+        if assigned(ffield_sizing_write) then
+          begin
+            for i:=0 to ffield_sizing_write.count-1 do
+              begin
+                fse:=pfield_sizing_entry(ffield_sizing_write[i]);
+                dispose(fse);
+              end;
+            ffield_sizing_write.free;
+            ffield_sizing_write:=nil;
+          end;
         stringdispose(objname);
         stringdispose(objrealname);
         stringdispose(import_lib);
@@ -4890,19 +5036,128 @@ implementation
       end;
 
 
+    procedure tabstractrecorddef.add_composition(carrier_sym: tobject; kind: tcomposition_kind);
+      var
+        e : pcomposition_entry;
+      begin
+        if not assigned(fcompositions) then
+          fcompositions:=tfplist.create;
+        new(e);
+        e^.carrier:=carrier_sym;
+        fillchar(e^.carrier_deref,sizeof(e^.carrier_deref),0);
+        e^.kind:=kind;
+        fcompositions.add(e);
+        include(objectoptions,oo_has_compositions);
+      end;
+
+
+    function tabstractrecorddef.composition_count: longint;
+      begin
+        if assigned(fcompositions) then
+          result:=fcompositions.count
+        else
+          result:=0;
+      end;
+
+
+    function tabstractrecorddef.composition_at(i: longint): pcomposition_entry;
+      begin
+        if assigned(fcompositions) and (i>=0) and (i<fcompositions.count) then
+          result:=pcomposition_entry(fcompositions[i])
+        else
+          result:=nil;
+      end;
+
+
     procedure tabstractrecorddef.buildderefimpl;
+      var
+        i : longint;
+        e : pcomposition_entry;
+        fse : pfield_sizing_entry;
+        fsym : tsym;
       begin
          inherited buildderefimpl;
          if not (df_copied_def in defoptions) then
            tstoredsymtable(symtable).buildderefimpl;
+         for i:=0 to composition_count-1 do
+           begin
+             e:=composition_at(i);
+             e^.carrier_deref.build(tsym(e^.carrier));
+           end;
+         { composablerecords: build the derefs for per-field sizing/alignment
+           overrides here, while derefdata is still being assembled. ppuwrite
+           runs after the derefdata block has already been serialized, so a
+           tderef.build() done there registers data the reader never sees ->
+           IE 200310221 on load. Snapshot the values alongside the deref and
+           let ppuwrite emit the pre-registered indices. }
+         if assigned(ffield_sizing_write) then
+           begin
+             for i:=0 to ffield_sizing_write.count-1 do
+               dispose(pfield_sizing_entry(ffield_sizing_write[i]));
+             ffield_sizing_write.clear;
+           end;
+         if oo_has_field_sizing in objectoptions then
+           begin
+             if not assigned(ffield_sizing_write) then
+               ffield_sizing_write:=tfplist.create;
+             for i:=0 to symtable.SymList.Count-1 do
+               begin
+                 fsym:=tsym(symtable.SymList[i]);
+                 if (fsym.typ=fieldvarsym) and
+                    ((tfieldvarsym(fsym).custom_align<>0) or
+                     (tfieldvarsym(fsym).custom_bitalign<>0) or
+                     (tfieldvarsym(fsym).custom_size<>-1) or
+                     (tfieldvarsym(fsym).custom_bitsize<>-1)) then
+                   begin
+                     new(fse);
+                     fse^.field_deref.reset;
+                     fse^.field_deref.build(fsym);
+                     fse^.custom_bitsize :=tfieldvarsym(fsym).custom_bitsize;
+                     fse^.custom_size    :=tfieldvarsym(fsym).custom_size;
+                     fse^.custom_align   :=tfieldvarsym(fsym).custom_align;
+                     fse^.custom_bitalign:=tfieldvarsym(fsym).custom_bitalign;
+                     ffield_sizing_write.add(fse);
+                   end;
+               end;
+           end;
       end;
 
 
     procedure tabstractrecorddef.derefimpl;
+      var
+        i : longint;
+        e : pcomposition_entry;
+        fse : pfield_sizing_entry;
+        fsym : tfieldvarsym;
       begin
         inherited derefimpl;
         if not (df_copied_def in defoptions) then
           tstoredsymtable(symtable).derefimpl(false);
+        for i:=0 to composition_count-1 do
+          begin
+            e:=composition_at(i);
+            e^.carrier:=tsym(e^.carrier_deref.resolve);
+          end;
+        { composablerecords: apply loaded per-field sizing overrides now that
+          the field derefs can be resolved. drop the transient list afterwards. }
+        if assigned(ffield_sizing_loaded) then
+          begin
+            for i:=0 to ffield_sizing_loaded.count-1 do
+              begin
+                fse:=pfield_sizing_entry(ffield_sizing_loaded[i]);
+                fsym:=tfieldvarsym(fse^.field_deref.resolve);
+                if assigned(fsym) then
+                  begin
+                    fsym.custom_bitsize :=fse^.custom_bitsize;
+                    fsym.custom_size    :=fse^.custom_size;
+                    fsym.custom_align   :=fse^.custom_align;
+                    fsym.custom_bitalign:=fse^.custom_bitalign;
+                  end;
+                dispose(fse);
+              end;
+            ffield_sizing_loaded.free;
+            ffield_sizing_loaded:=nil;
+          end;
       end;
 
 

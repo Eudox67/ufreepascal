@@ -70,7 +70,7 @@ interface
        unleashedmodeswitches = objfpcmodeswitches+[m_default_ansistring,m_underscoreisseparator,m_duplicate_names,
         m_advanced_records,m_array_operators,m_anonymous_functions,m_function_references,
         m_statement_expressions,m_array_equality,m_inline_var,m_tuples,m_match,m_autofree,m_multiline_strings,
-        m_multi_var_init,m_stringordcast,m_for_step,m_flexible_arrays,m_unleashed];
+        m_multi_var_init,m_stringordcast,m_for_step,m_flexible_arrays,m_composable_records,m_implicit_generics,m_unleashed];
        tpmodeswitches =
          [m_tp7,m_tp_procvar,m_duplicate_names];
 {$ifdef gpc_mode}
@@ -397,6 +397,12 @@ Const
        binary_linker_version_override,      // PE optional header MajorLinkerVersion.Minor
        binary_os_version_override : ansistring;  // PE optional header MajorOperatingSystemVersion.Minor
        binary_signature_override_set : boolean;  // true when --fpcsignature=<anything> was passed
+
+       { --striprtti CLI flag: forces m_strip_rtti behaviour globally and
+         survives the modeswitch reset that any `$mode X` directive
+         performs (mode-from-source would otherwise drop the modeswitch).
+         Read by ncgrtti.rtti_string alongside the modeswitch check. }
+       force_striprtti_cli : boolean;
 
        { linking }
        usewindowapi  : boolean;

@@ -709,9 +709,11 @@ implementation
 
     function result_type(options:TSingleTypeOptions):tdef;
       begin
-        { for array-of-X return types, use read_anon_type; otherwise
-          stick with single_type to avoid breaking type resolution }
-        if current_scanner.token in [_ARRAY,_PACKED,_BITPACKED] then
+        { unleashed: inline `array of X` / `packed array ...` / `bitpacked
+          array ...` as a function result goes through read_anon_type; classic
+          modes keep requiring a named type identifier (stock FPC behaviour) }
+        if (m_unleashed in current_settings.modeswitches) and
+           (current_scanner.token in [_ARRAY,_PACKED,_BITPACKED]) then
           read_anon_type(result,false,nil)
         else
           single_type(result,options);
@@ -923,6 +925,37 @@ implementation
         member_blocktype:=bt_general;
         rtti_attrs_def := nil;
         repeat
+          { composablerecords: a SIZE/BITSIZE/ALIGN/BITALIGN id that the
+            pre-body modifier parser ended up reclassifying as a field name
+            is sitting in the bridge global; route it to the regular
+            field-decl path before the case dispatcher (which is keyed on
+            _ID and would otherwise hit the default "ident expected" error
+            on the `:` / `,` / `;` we are now sitting on). }
+          if composable_pre_consumed_field_name<>'' then
+            begin
+              check_unbound_attributes;
+              vdoptions:=[vd_record];
+              if classfields then
+                include(vdoptions,vd_class);
+              if not (m_implicit_generics in current_settings.modeswitches) then
+                include(vdoptions,vd_check_generic);
+              if threadvarfields then
+                include(vdoptions,vd_threadvar);
+              fldCount:=current_structdef.symtable.SymList.Count;
+              read_record_fields(vdoptions,nil,nil,hadgeneric,attr_element_count);
+              if assigned(rtti_attrs_def) then
+                begin
+                  while attr_element_count>1 do
+                    begin
+                      trtti_attribute_list.copyandbind(rtti_attrs_def,(current_structdef.symtable.SymList[fldCount] as tfieldvarsym).rtti_attribute_list);
+                      inc(fldCount);
+                      dec(attr_element_count);
+                    end;
+                  if fldCount<current_structdef.symtable.SymList.Count then
+                    trtti_attribute_list.bind(rtti_attrs_def,(current_structdef.symtable.SymList[fldCount] as tfieldvarsym).rtti_attribute_list);
+                end;
+              continue;
+            end;
           case current_scanner.token of
             _TYPE :
               begin
@@ -1231,6 +1264,30 @@ implementation
                 consume(_END);
                 break;
               end;
+            _RECORD,
+            _PACKED,
+            _BITPACKED :
+              begin
+                { inline anonymous record (any flavour: plain / packed /
+                  bitpacked) as a member - delegate to read_record_fields
+                  where the composablerecords hook picks it up }
+                if not (m_composable_records in current_settings.modeswitches) then
+                  consume(_ID)
+                else
+                  begin
+                    if not fields_allowed then
+                      Message(parser_e_field_not_allowed_here);
+                    check_unbound_attributes;
+                    vdoptions:=[vd_record];
+                    if classfields then
+                      include(vdoptions,vd_class);
+                    if not (m_implicit_generics in current_settings.modeswitches) then
+                      include(vdoptions,vd_check_generic);
+                    if threadvarfields then
+                      include(vdoptions,vd_threadvar);
+                    read_record_fields(vdoptions,nil,nil,hadgeneric,attr_element_count);
+                  end;
+              end;
             else
               consume(_ID); { Give a ident expected message, like tp7 }
           end;
@@ -1271,6 +1328,12 @@ implementation
          hadgendummy : boolean;
          alignment: Integer;
          dummyattrelcount : Integer;
+         pushed_default_type : boolean;
+         srsym : tsym;
+         srsymtable : TSymtable;
+         pre_body_size, pre_body_bitsize : longint;
+         pre_body_align, pre_body_bitalign : shortint;
+         pre_body_sorg : TIDString;
       begin
          old_current_structdef:=current_structdef;
          old_current_genericdef:=current_genericdef;
@@ -1297,8 +1360,12 @@ implementation
              current_structdef:=crecorddef.create(recst.name^,recst);
            end;
          result:=current_structdef;
-         { insert in symtablestack }
+         { insert in symtablestack - wrap the entire body in try-finally so
+           a parse-time exception (Fatal syntax error etc.) inside the body
+           doesn't leave the stack with the record's symtable still on top,
+           which would trip internalerror(200601232) in the outer pop later }
          symtablestack.push(recst);
+         try
 
          { usage of specialized type inside its generic template }
          if assigned(genericdef) then
@@ -1339,6 +1406,169 @@ implementation
            olddef:=nil;
          set_typesym;
 
+         { composablerecords: `bitpacked record of T` modifier establishes
+           DEFAULT_TYPE for the C-style `name: N` / `pad N` bitfield syntax
+           inside the body. parse + push here before dispatching to
+           parse_record_members / read_record_fields. plain `record of T`
+           is rejected (no place for the default type to apply). }
+         pushed_default_type:=false;
+         pre_body_size:=-1;
+         pre_body_bitsize:=-1;
+         pre_body_align:=0;
+         pre_body_bitalign:=0;
+         if (m_composable_records in current_settings.modeswitches) and
+            (current_scanner.token=_OF) then
+           begin
+             if recst.usefieldalignment<>bit_alignment then
+               begin
+                 Message(parser_e_record_of_requires_bitpacked);
+                 consume(_OF);
+                 if current_scanner.token=_ID then
+                   consume(_ID);
+               end
+             else
+               begin
+                 consume(_OF);
+                 if current_scanner.token=_ID then
+                   begin
+                     searchsym_type(current_scanner.pattern,srsym,srsymtable);
+                     if assigned(srsym) and (srsym.typ=typesym) then
+                       begin
+                         push_composable_default_type(ttypesym(srsym).typedef);
+                         pushed_default_type:=true;
+                         consume(_ID);
+                       end
+                     else
+                       begin
+                         Message1(sym_e_id_no_member,current_scanner.orgpattern);
+                         consume(_ID);
+                       end;
+                   end
+                 else
+                   consume(_ID);
+               end;
+           end;
+
+         { composablerecords: pre-body modifiers - strict ordering, each
+           modifier at most once. `size` XOR `bitsize` mutex,
+           `align` XOR `bitalign` mutex. `bitalign` only meaningful in
+           a bit-aligned record (`bitpacked record`). }
+         if m_composable_records in current_settings.modeswitches then
+           begin
+             dummyattrelcount:=0; { bit 0=size, 1=bitsize, 2=align, 3=bitalign }
+             while (current_scanner.token=_ID) and
+                   ((current_scanner.pattern='SIZE') or
+                    (current_scanner.pattern='BITSIZE') or
+                    (current_scanner.pattern='ALIGN') or
+                    (current_scanner.pattern='BITALIGN')) do
+               begin
+                 { the id might be a field name (e.g. `record size: integer; end;`)
+                   instead of a modifier. save it, consume, then peek the next
+                   token - if it's `:` / `,` / `;`, hand the name off to
+                   read_record_fields as a pre-consumed first field and bail
+                   out of the modifier loop (without firing the mutex / dup
+                   checks - those apply to actual modifiers, not field names). }
+                 pre_body_sorg:=current_scanner.orgpattern;
+                 if current_scanner.pattern='SIZE' then
+                   begin
+                     consume(_ID);
+                     if current_scanner.token in [_COLON,_COMMA,_SEMICOLON] then
+                       begin
+                         composable_pre_consumed_field_name:=pre_body_sorg;
+                         break;
+                       end;
+                     if (dummyattrelcount and 1)<>0 then
+                       Message1(parser_e_duplicate_modifier,'size');
+                     if (dummyattrelcount and 2)<>0 then
+                       Message(parser_e_size_bitsize_exclusive);
+                     dummyattrelcount:=dummyattrelcount or 1;
+                     pre_body_size:=get_intconst.svalue;
+                     if pre_body_size<1 then
+                       begin
+                         Message(parser_e_illegal_expression);
+                         pre_body_size:=-1;
+                       end;
+                   end
+                 else if current_scanner.pattern='BITSIZE' then
+                   begin
+                     consume(_ID);
+                     if current_scanner.token in [_COLON,_COMMA,_SEMICOLON] then
+                       begin
+                         composable_pre_consumed_field_name:=pre_body_sorg;
+                         break;
+                       end;
+                     if (dummyattrelcount and 2)<>0 then
+                       Message1(parser_e_duplicate_modifier,'bitsize');
+                     if (dummyattrelcount and 1)<>0 then
+                       Message(parser_e_size_bitsize_exclusive);
+                     dummyattrelcount:=dummyattrelcount or 2;
+                     pre_body_bitsize:=get_intconst.svalue;
+                     if pre_body_bitsize<1 then
+                       begin
+                         Message(parser_e_illegal_expression);
+                         pre_body_bitsize:=-1;
+                       end;
+                   end
+                 else if current_scanner.pattern='ALIGN' then
+                   begin
+                     consume(_ID);
+                     if current_scanner.token in [_COLON,_COMMA,_SEMICOLON] then
+                       begin
+                         composable_pre_consumed_field_name:=pre_body_sorg;
+                         break;
+                       end;
+                     if (dummyattrelcount and 4)<>0 then
+                       Message1(parser_e_duplicate_modifier,'align');
+                     if (dummyattrelcount and 8)<>0 then
+                       Message(parser_e_align_bitalign_exclusive);
+                     dummyattrelcount:=dummyattrelcount or 4;
+                     pre_body_align:=get_intconst.svalue;
+                     if (pre_body_align<1) or
+                        ((pre_body_align and (pre_body_align-1))<>0) then
+                       begin
+                         Message(parser_e_illegal_expression);
+                         pre_body_align:=0;
+                       end;
+                   end
+                 else { BITALIGN }
+                   begin
+                     consume(_ID);
+                     if current_scanner.token in [_COLON,_COMMA,_SEMICOLON] then
+                       begin
+                         composable_pre_consumed_field_name:=pre_body_sorg;
+                         break;
+                       end;
+                     if (dummyattrelcount and 8)<>0 then
+                       Message1(parser_e_duplicate_modifier,'bitalign');
+                     if (dummyattrelcount and 4)<>0 then
+                       Message(parser_e_align_bitalign_exclusive);
+                     dummyattrelcount:=dummyattrelcount or 8;
+                     pre_body_bitalign:=get_intconst.svalue;
+                     if pre_body_bitalign<1 then
+                       begin
+                         Message(parser_e_illegal_expression);
+                         pre_body_bitalign:=0;
+                       end;
+                   end;
+               end;
+             if current_scanner.token=_OF then
+               begin
+                 Message(parser_e_of_must_be_first);
+                 consume(_OF);
+                 if current_scanner.token=_ID then
+                   consume(_ID);
+               end;
+           end;
+
+         { forgiving syntax: accept an optional `;` between pre-body
+           modifiers and the body, matching the natural reading flow of
+           `record of T bitsize N;` `  fields...` }
+         while (m_composable_records in current_settings.modeswitches) and
+               (current_scanner.token=_SEMICOLON) do
+           consume(_SEMICOLON);
+
+         try
+
          if m_advanced_records in current_settings.modeswitches then
            begin
              parse_record_members(recsym);
@@ -1354,6 +1584,11 @@ implementation
                add_typedconst_init_routine(current_structdef);
              consume(_END);
             end;
+
+         finally
+           if pushed_default_type then
+             pop_composable_default_type;
+         end;
 
          reset_typesym;
 
@@ -1371,6 +1606,40 @@ implementation
                  recst.explicitrecordalignment:=shortint(alignment);
                end;
            end;
+         { composablerecords: apply pre-body modifiers parsed before the
+           record body. bitsize is bit-precise (peeks the in-construction
+           databitsize); size is byte-precise. align bumps record alignment. }
+         if pre_body_bitsize>=0 then
+           begin
+             if recst.current_bit_offset>pre_body_bitsize then
+               Message2(parser_e_record_exceeds_bitsize,
+                        tostr(recst.current_bit_offset),tostr(pre_body_bitsize));
+             recst.datasize:=(pre_body_bitsize+7) div 8;
+           end;
+         if pre_body_size>=0 then
+           begin
+             if recst.datasize>pre_body_size then
+               Message2(parser_e_record_exceeds_size,
+                        tostr(recst.datasize),tostr(pre_body_size));
+             recst.datasize:=pre_body_size;
+           end;
+         if pre_body_align>0 then
+           begin
+             if pre_body_align>recst.recordalignment then
+               recst.recordalignment:=pre_body_align;
+             if pre_body_align>recst.explicitrecordalignment then
+               recst.explicitrecordalignment:=pre_body_align;
+           end;
+         { `bitalign N` only meaningful in bit-aligned record; convert
+           to byte alignment by ceil(N/8) for the record-level alignment }
+         if pre_body_bitalign>0 then
+           begin
+             alignment:=(pre_body_bitalign+7) div 8;
+             if alignment>recst.recordalignment then
+               recst.recordalignment:=alignment;
+             if alignment>recst.explicitrecordalignment then
+               recst.explicitrecordalignment:=alignment;
+           end;
          { make the record size aligned (has to be done before inserting the
            parameters, because that may depend on the record's size) }
          recst.addalignmentpadding;
@@ -1379,7 +1648,9 @@ implementation
            the jvm backend) }
          insert_struct_hidden_paras(trecorddef(current_structdef));
          { restore symtable stack }
-         symtablestack.pop(recst);
+         finally
+           symtablestack.pop(recst);
+         end;
          if trecorddef(current_structdef).is_packed and is_managed_type(current_structdef) then
            Message(type_e_no_packed_inittable);
          { restore old state }
@@ -1403,6 +1674,9 @@ implementation
         oldpackrecords : longint;
         defpos,storepos : tfileposinfo;
         name: TIDString;
+        { composablerecords: `(kA, kB, kC) of T` anonymous-enum storage type }
+        storage_def : tdef;
+        storage_lo, storage_hi : tconstexprint;
 
         procedure expr_type;
         var
@@ -1860,6 +2134,28 @@ implementation
                                  { we need a valid range for debug information }
                                  range_to_type(lowval,highval,indexdef);
                            end
+                         else if (m_unleashed in current_settings.modeswitches) and
+                                 (pt.nodetype=ordconstn) and
+                                 is_integer(pt.resultdef) then
+                           begin
+                             { array[N] is shorthand for array[0..N-1] }
+                             highval:=tordconstnode(pt).value;
+                             if highval<1 then
+                               begin
+                                 Message(parser_e_array_lower_less_than_upper_bound);
+                                 highval:=1;
+                               end;
+                             lowval:=0;
+                             highval:=highval-1;
+                             if (lowval<int64(low(asizeint))) or
+                                (highval>high(asizeint)) then
+                               begin
+                                 Message(parser_e_array_range_out_of_bounds);
+                                 lowval:=0;
+                                 highval:=0;
+                               end;
+                             range_to_type(lowval,highval,indexdef);
+                           end
                          else
                            Message(sym_e_error_in_type_def)
                        end;
@@ -2182,6 +2478,31 @@ implementation
                 until not try_to_consume(_COMMA);
                 def:=aktenumdef;
                 consume(_RKLAMMER);
+                { composablerecords: optional `of T` storage type for the
+                  anonymous enum. shrinks (or grows) the enum's savesize to
+                  match T, after validating that every declared enum value
+                  fits in T's ordinal range. analogue of `union of T` and
+                  `bitpacked record of T`. }
+                if (m_composable_records in current_settings.modeswitches) and
+                   (current_scanner.token=_OF) then
+                  begin
+                    consume(_OF);
+                    single_type(storage_def,[stoAllowSpecialization]);
+                    if not is_ordinal(storage_def) then
+                      Message1(parser_e_enum_storage_not_ordinal,storage_def.typename)
+                    else
+                      begin
+                        getrange(storage_def,storage_lo,storage_hi);
+                        if (aktenumdef.min<storage_lo) or
+                           (aktenumdef.max>storage_hi) then
+                          Message3(parser_e_enum_value_out_of_storage,
+                                   tostr(aktenumdef.max),
+                                   storage_def.typename,
+                                   tostr(storage_hi))
+                        else
+                          aktenumdef.calcsavesize(storage_def.size);
+                      end;
+                  end;
 {$ifdef jvm}
                 jvm_maybe_create_enum_class(name,def);
 {$endif}
