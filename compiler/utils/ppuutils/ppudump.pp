@@ -1359,6 +1359,23 @@ begin
   writeln([space]);
 end;
 
+
+procedure ReadLwgCanonicals;
+var
+  c, i : longint;
+  s : ansistring;
+begin
+  c:=ppufile.getlongint;
+  Writeln([space,'Lightgenerics canonicals: ',c]);
+  for i:=0 to c-1 do
+    begin
+      s:=ppufile.getstring;
+      Writeln([space,'  ',i,' : ',s]);
+    end;
+  writeln([space]);
+end;
+
+
 function getexprint:Tconstexprint;
 
 begin
@@ -2513,7 +2530,8 @@ const
          'm_flexible_arrays',     { allow `array[] of T` as last field of a record (C99-style FAM) }
          'm_composable_records',  { record composition: union, anonymous embed, expose, offsetof }
          'm_static_section',      { allow `static` declaration section in function/procedure bodies }
-         'm_inline_static'        { allow `static x := ...` inline declarations inside statement blocks }
+         'm_inline_static',       { allow `static x := ...` inline declarations inside statement blocks }
+         'm_lightgenerics'        { share method bodies across same-shape generic specializations }
        );
        { optimizer }
        optimizerswitchname : array[toptimizerswitch] of string[50] =
@@ -5127,6 +5145,9 @@ begin
 
          ibunitimportsyms :
            ReadUnitImportSyms;
+
+         iblwgcanonicals :
+           ReadLwgCanonicals;
 
          iberror :
            begin
