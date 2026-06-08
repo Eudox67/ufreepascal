@@ -1034,7 +1034,9 @@ implementation
                exit;
              end;
 
-            if assigned(genericparams) and assigned(current_genericdef) then
+            { unleashed allows nested generic methods inside generic classes }
+            if assigned(genericparams) and assigned(current_genericdef) and
+               not (m_unleashed in current_settings.modeswitches) then
               Message(parser_f_no_generic_inside_generic);
 
             { method  ? }
@@ -1393,6 +1395,11 @@ implementation
                        (pd.genericdef.typ<>procdef) then
                       internalerror(200512115);
                   end
+                else if assigned(genericdef) then
+                  { nested generic method specialization: genericdef was passed
+                    explicitly by generate_specialization_phase2, so this is the
+                    specialization itself, not an explicit method implementation }
+                  include(pd.defoptions,df_specialization)
                 else
                   Message(parser_e_explicit_method_implementation_for_specializations_not_allowed);
               end;
@@ -3227,6 +3234,15 @@ var
       begin
         parse_proc_direc:=false;
         name:=tokeninfo^[current_scanner.idtoken].str;
+
+      { Yield `static` to the static-section parser outside a class/object
+        body, so `procedure Foo; static name : Type = ...` opens a static
+        section rather than tripping the `static` method directive }
+        if (current_scanner.idtoken=_STATIC) and
+           (m_static_section in current_settings.modeswitches) and
+           (symtablestack.top.symtabletype<>ObjectSymtable) and
+           not (po_classmethod in pd.procoptions) then
+          exit;
 
       { Hint directive? Then exit immediately }
         if (m_hintdirective in current_settings.modeswitches) then
